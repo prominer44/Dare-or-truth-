@@ -1,10 +1,11 @@
 import os
 import re
 import time
-import uuid
 import random
 import sqlite3
-from typing import Optional, List, Dict, Tuple
+import logging
+import asyncio
+from typing import Optional, List, Tuple
 
 from telegram import (
     Update,
@@ -14,6 +15,7 @@ from telegram import (
     InputTextMessageContent,
 )
 from telegram.constants import ParseMode
+from telegram.error import RetryAfter, TimedOut, NetworkError, BadRequest
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -23,6 +25,15 @@ from telegram.ext import (
     ContextTypes,
     filters,
 )
+
+# =========================
+# LOGGING
+# =========================
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(message)s",
+)
+log = logging.getLogger("jorathaghighatpro")
 
 # =========================
 # CONFIG
@@ -57,8 +68,8 @@ def init_db() -> None:
     cur.execute("""
     CREATE TABLE IF NOT EXISTS questions (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
-        qtype TEXT NOT NULL,        -- truth/dare
-        level TEXT NOT NULL,        -- normal/18
+        qtype TEXT NOT NULL,
+        level TEXT NOT NULL,
         text TEXT NOT NULL,
         enabled INTEGER NOT NULL DEFAULT 1,
         created_at INTEGER NOT NULL
@@ -73,34 +84,32 @@ def init_db() -> None:
         qtype TEXT NOT NULL,
         level TEXT NOT NULL,
         text TEXT NOT NULL,
-        status TEXT NOT NULL DEFAULT 'pending', -- pending/approved/rejected
+        status TEXT NOT NULL DEFAULT 'pending',
         created_at INTEGER NOT NULL,
         reviewed_by INTEGER,
         reviewed_at INTEGER
     );
     """)
 
-    # games: kind = group | inline
     cur.execute("""
     CREATE TABLE IF NOT EXISTS games (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
-        kind TEXT NOT NULL,
-        status TEXT NOT NULL,          -- lobby/running/ended
+        kind TEXT NOT NULL,               -- group | inline
+        status TEXT NOT NULL,             -- lobby | running | ended
         owner_id INTEGER NOT NULL,
 
-        board_chat_id INTEGER,         -- for group
-        board_message_id INTEGER,      -- for group
-        board_inline_id TEXT,          -- for inline
+        board_chat_id INTEGER,
+        board_message_id INTEGER,
+        board_inline_id TEXT,
 
         created_at INTEGER NOT NULL,
-        locked INTEGER NOT NULL DEFAULT 0,
+
         allow_mid_join INTEGER NOT NULL DEFAULT 1,
         show_prev_question INTEGER NOT NULL DEFAULT 1,
         allow_18 INTEGER NOT NULL DEFAULT 1,
 
-        view TEXT NOT NULL DEFAULT 'main',   -- main/settings/players/stats
-        phase TEXT NOT NULL DEFAULT 'lobby', -- lobby/choose/question/wait_confirm
-
+        view TEXT NOT NULL DEFAULT 'main',    -- main/settings/players/stats
+        phase TEXT NOT NULL DEFAULT 'lobby',  -- lobby/choose/question/wait_confirm
         current_turn_index INTEGER NOT NULL DEFAULT 0,
 
         last_q_text TEXT DEFAULT '',
@@ -126,7 +135,6 @@ def init_db() -> None:
     );
     """)
 
-    # current action
     cur.execute("""
     CREATE TABLE IF NOT EXISTS actions (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -140,14 +148,13 @@ def init_db() -> None:
     );
     """)
 
-    # admin forced queue
     cur.execute("""
     CREATE TABLE IF NOT EXISTS forced_questions (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         game_id INTEGER NOT NULL,
         user_id INTEGER NOT NULL,
-        qtype TEXT,              -- nullable
-        level TEXT,              -- nullable
+        qtype TEXT,
+        level TEXT,
         text TEXT NOT NULL,
         created_at INTEGER NOT NULL
     );
@@ -156,9 +163,6 @@ def init_db() -> None:
     conn.commit()
     conn.close()
 
-# =========================
-# Seed questions (کم، ولی سیستم Bulk Add میذاره 1000تا بریزی)
-# =========================
 SEED = [
     ("truth","normal","آخرین باری که به کسی دروغ گفتی کی بود و چرا؟"),
     ("truth","normal","اگه فقط یک راز رو مجبور بودی بگی، چی می‌گفتی؟"),
@@ -168,20 +172,17 @@ SEED = [
     ("dare","normal","یک ویس ۵ ثانیه‌ای بفرست و بگو: «من الان تو بازی‌ام!»"),
     ("dare","normal","۳۰ ثانیه نقش یک مجری تلویزیونی رو بازی کن."),
     ("dare","normal","به یک نفر یک تعریف خیلی خاص و عجیب بگو."),
-    ("dare","normal","اسم ۳ نفر رو بگو که باهاشون راحت‌تری."),
     ("truth","18","تا حالا عمداً کسی رو جذب خودت کردی و بعدش عقب کشیدی؟"),
     ("truth","18","بیشتر جذب رفتار می‌شی یا ظاهر؟ چرا؟"),
-    ("truth","18","آخرین حسادتی که کردی بابت چی بود؟"),
-    ("dare","18","یک جمله دوپهلو ولی محترمانه بگو 😏"),
     ("dare","18","سه ویژگی که تو رابطه برات حیاتی‌ه رو بگو."),
-    ("dare","18","یک اعتراف مبهم بکن: «یه چیزی هست که هیچ‌وقت نگفتم…»"),
+    ("dare","18","یک جمله دوپهلو ولی محترمانه بگو 😏"),
 ]
 
 PENALTIES = [
-    "مجازات: ۱ تا از تعویض‌هات کم شد.",
-    "مجازات: دور بعد فقط «شانسی» داری.",
-    "مجازات: ۱ ویس ۵ ثانیه‌ای باید بفرستی.",
-    "مجازات: ۱ امتیاز منفی ثبت شد.",
+    "مجازات: ۱ امتیاز منفی ثبت شد ⚠️",
+    "مجازات: ۱ ویس ۵ ثانیه‌ای باید بفرستی 🎙",
+    "مجازات: دور بعد فقط «شانسی» داری 🎲",
+    "مجازات: ۱ تا از تعویض‌هات کم شد 🔄",
     "مجازات: ادمین می‌تونه برات سؤال انتخاب کنه 😈",
 ]
 
@@ -208,7 +209,6 @@ def esc(s: str) -> str:
     return (s or "").replace("&","&amp;").replace("<","&lt;").replace(">","&gt;")
 
 def mention(uid: int, name: str) -> str:
-    # HTML mention
     return f'<a href="tg://user?id={uid}">{esc(name)}</a>'
 
 def parse_bulk(text: str) -> List[str]:
@@ -217,7 +217,6 @@ def parse_bulk(text: str) -> List[str]:
     for ln in lines:
         m = re.match(r"^\s*\d+\s*[\=\)\-\.]\s*(.+)$", ln)
         out.append((m.group(1) if m else ln).strip())
-    # dedupe
     seen=set()
     res=[]
     for t in out:
@@ -381,16 +380,23 @@ def last_action(gid: int) -> Optional[sqlite3.Row]:
     return r
 
 # =========================
-# RENDER (Single message UI)
+# LOCKS (برای حذف لگ/هنگ ادیت)
+# =========================
+def game_lock(app: Application, gid: int) -> asyncio.Lock:
+    locks = app.bot_data.setdefault("game_locks", {})
+    if gid not in locks:
+        locks[gid] = asyncio.Lock()
+    return locks[gid]
+
+# =========================
+# UI Builders
 # =========================
 def kb_main(g: sqlite3.Row, uid: int) -> InlineKeyboardMarkup:
     gid=int(g["id"])
     players=list_players(gid)
-    cp=current_player(g)
     phase=g["phase"]
     allow18=int(g["allow_18"])==1
 
-    # Top row: join + start + settings
     rows=[]
     join_label = f"✋ منم میخوام بازی کنم ({len(players)})"
     rows.append([
@@ -398,11 +404,10 @@ def kb_main(g: sqlite3.Row, uid: int) -> InlineKeyboardMarkup:
         InlineKeyboardButton("⚙️ تنظیمات", callback_data=f"g{gid}:view:settings"),
     ])
 
-    # owner start button in lobby
+    # Start only useful in lobby; show for all, but only owner can execute (toast)
     if g["status"]=="lobby":
         rows.append([InlineKeyboardButton("🎮 شروع بازی", callback_data=f"g{gid}:start")])
 
-    # Players / Stats / End
     rows.append([
         InlineKeyboardButton("👥 بازیکنان", callback_data=f"g{gid}:view:players"),
         InlineKeyboardButton("📊 آمار", callback_data=f"g{gid}:view:stats"),
@@ -412,11 +417,9 @@ def kb_main(g: sqlite3.Row, uid: int) -> InlineKeyboardMarkup:
         InlineKeyboardButton("❌ پایان بازی", callback_data=f"g{gid}:end"),
     ])
 
-    # If running: show choose/question controls
     if g["status"]=="running":
         can_reroll = rerolls_left(gid, uid)>0
         if phase=="choose":
-            # question type buttons
             rows.append([
                 InlineKeyboardButton("👀 حقیقت", callback_data=f"g{gid}:pick:truth:normal"),
                 InlineKeyboardButton("😅 جرأت", callback_data=f"g{gid}:pick:dare:normal"),
@@ -438,15 +441,12 @@ def kb_main(g: sqlite3.Row, uid: int) -> InlineKeyboardMarkup:
                 InlineKeyboardButton("❌ انجام ندادم", callback_data=f"g{gid}:refuse"),
             ])
         elif phase=="wait_confirm":
-            # both can see but only counterpart can confirm
             rows.append([
                 InlineKeyboardButton("👍 تأیید", callback_data=f"g{gid}:confirm:yes"),
                 InlineKeyboardButton("👎 رد", callback_data=f"g{gid}:confirm:no"),
             ])
 
-    # bottom: bump board (group only works fully)
     rows.append([InlineKeyboardButton("⬇️ انتقال به پایین", callback_data=f"g{gid}:bump")])
-
     return InlineKeyboardMarkup(rows)
 
 def kb_settings(g: sqlite3.Row) -> InlineKeyboardMarkup:
@@ -462,17 +462,26 @@ def kb_settings(g: sqlite3.Row) -> InlineKeyboardMarkup:
     ]
     return InlineKeyboardMarkup(rows)
 
+def players_line(gid: int) -> str:
+    ps=list_players(gid)
+    if not ps:
+        return "—"
+    # short list
+    names=[esc(p["name"]) for p in ps[:8]]
+    extra = f" +{len(ps)-8}" if len(ps)>8 else ""
+    return "، ".join(names) + extra
+
 def render_text(g: sqlite3.Row) -> str:
     gid=int(g["id"])
-    players=list_players(gid)
+    ps=list_players(gid)
     cp=current_player(g)
     view=g["view"]
     status=g["status"]
     phase=g["phase"]
 
     header = "😈 <b>جرأت/حقیقت Pro</b>\n"
-    header += f"🆔 <code>{gid}</code> | 🧑‍🤝‍🧑 <b>{len(players)}</b> نفر\n"
-    header += f"⏱ تایمر: <b>{TURN_TIMEOUT_SEC}s</b> | 🔄 تعویض هر نفر: <b>{MAX_REROLL_PER_PLAYER}</b>\n"
+    header += f"🆔 <code>{gid}</code> | 🧑‍🤝‍🧑 <b>{len(ps)}</b> نفر | ⏱ <b>{TURN_TIMEOUT_SEC}s</b>\n"
+    header += f"👥 بازیکنان: {players_line(gid)}\n"
     header += "— — — — —\n"
 
     if view=="settings":
@@ -480,49 +489,48 @@ def render_text(g: sqlite3.Row) -> str:
         body += f"➕ ورود وسط بازی: {'فعال✅' if int(g['allow_mid_join'])==1 else 'خاموش❌'}\n"
         body += f"❓ سوال قبلی: {'فعال✅' if int(g['show_prev_question'])==1 else 'خاموش❌'}\n"
         body += f"🔞 سوالات +18: {'فعال✅' if int(g['allow_18'])==1 else 'خاموش❌'}\n"
+        body += "\n🏠 برای برگشت «پایه» رو بزن."
         return header+body
 
     if view=="players":
         body="👥 <b>بازیکنان</b>\n"
-        if not players:
+        if not ps:
             body+="—\n"
         else:
-            for i,p in enumerate(players, start=1):
+            for i,p in enumerate(ps, start=1):
                 body += f"{i}) {mention(int(p['user_id']), p['name'])} | 🔄{p['rerolls_left']} | ⏭{p['skips_used']} | ⚠️{p['penalties']}\n"
         body += "\n🏠 برای برگشت «پایه» رو بزن."
         return header+body
 
     if view=="stats":
         body="📊 <b>آمار بازی</b>\n"
-        if players:
-            for p in players:
-                body += f"• {mention(int(p['user_id']), p['name'])}: نوبت {p['turns']} | مجازات {p['penalties']} | رد نوبت {p['skips_used']} | تعویض باقی {p['rerolls_left']}\n"
-        lastq = g["last_q_text"] or ""
+        if ps:
+            for p in ps:
+                body += f"• {mention(int(p['user_id']), p['name'])}: نوبت {p['turns']} | مجازات {p['penalties']} | رد نوبت {p['skips_used']} | تعویض {p['rerolls_left']}\n"
+        lastq = (g["last_q_text"] or "").strip()
         if lastq:
             body += "\n🧾 <b>آخرین سوال:</b>\n"
-            body += f"{esc(lastq[:400])}\n"
+            body += f"{esc(lastq[:600])}\n"
         body += "\n🏠 برای برگشت «پایه» رو بزن."
         return header+body
 
-    # main view
+    # MAIN
     if status=="lobby":
         body="🎮 <b>لابی</b>\n"
-        body+="1) هرکی می‌خواد بازی کنه «منم میخوام بازی کنم» رو بزنه.\n"
-        body+="2) سازنده «شروع بازی» رو بزنه.\n"
-        body+="\n📌 بازی کم‌اسپم: فقط همین پیام آپدیت میشه."
+        body+="• هرکی می‌خواد بازی کنه «منم میخوام بازی کنم» رو بزنه.\n"
+        body+="• فقط سازنده بازی می‌تونه «شروع بازی» رو بزنه.\n"
+        body+="\n📌 این پیام آپدیت میشه (اسپم صفر)."
         return header+body
 
     if status=="ended":
-        body="🛑 <b>بازی تمام شد</b>\n"
-        body+="برای شروع دوباره، یک بازی جدید بساز."
-        return header+body
+        return header+"🛑 <b>بازی تمام شد</b>\nبرای شروع دوباره، یک بازی جدید بساز."
 
-    # running
     if not cp:
         return header+"❌ بازیکنی نیست."
-    body = "🔥 <b>بازی شروع شد</b>\n"
+
+    body="🔥 <b>بازی شروع شد</b>\n"
     body += f"👤 نوبت: {mention(int(cp['user_id']), cp['name'])}\n"
-    body += f"🎛 فاز: <b>{'انتخاب' if phase=='choose' else 'سوال' if phase=='question' else 'تأیید'}</b>\n\n"
+    body += f"🎛 وضعیت: <b>{'انتخاب' if phase=='choose' else 'سوال' if phase=='question' else 'تأیید'}</b>\n\n"
 
     if phase=="choose":
         body += "❓ <b>نوع سوالاتو انتخاب کن</b>"
@@ -532,7 +540,7 @@ def render_text(g: sqlite3.Row) -> str:
         la=last_action(gid)
         if la:
             body += f"📌 <b>{'حقیقت' if la['qtype']=='truth' else 'جرأت'}</b> | سطح: <b>{'18+' if la['level']=='18' else 'معمولی'}</b>\n\n"
-            body += f"❓ {esc(la['text'][:800])}"
+            body += f"❓ {esc(la['text'][:900])}"
         else:
             body += "❓ سوالی ثبت نشده."
         return header+body
@@ -541,57 +549,85 @@ def render_text(g: sqlite3.Row) -> str:
         la=last_action(gid)
         body += "⏳ منتظر تایید طرف مقابل…\n\n"
         if la:
-            body += f"❓ {esc(la['text'][:600])}"
+            body += f"❓ {esc(la['text'][:700])}"
         return header+body
 
     return header+body
 
 # =========================
-# EDIT Board
+# Robust edit with retry + lock
 # =========================
-async def edit_board(context: ContextTypes.DEFAULT_TYPE, g: sqlite3.Row, uid_for_kb: int, force_view: Optional[str]=None):
-    if force_view:
-        set_game_fields(int(g["id"]), view=force_view)
-        g=get_game(int(g["id"]))
-
-    text=render_text(g)
-    markup = kb_settings(g) if g["view"]=="settings" else kb_main(g, uid_for_kb)
-
-    try:
-        if g["kind"]=="group":
-            await context.bot.edit_message_text(
-                chat_id=int(g["board_chat_id"]),
-                message_id=int(g["board_message_id"]),
-                text=text,
-                parse_mode=ParseMode.HTML,
-                reply_markup=markup,
-                disable_web_page_preview=True,
-            )
-        else:
-            await context.bot.edit_message_text(
-                inline_message_id=str(g["board_inline_id"]),
-                text=text,
-                parse_mode=ParseMode.HTML,
-                reply_markup=markup,
-                disable_web_page_preview=True,
-            )
-    except Exception:
-        # group fallback: send new board if old one can't be edited
-        if g["kind"]=="group":
-            try:
-                msg = await context.bot.send_message(
+async def _edit_message_safe(context: ContextTypes.DEFAULT_TYPE, g: sqlite3.Row, text: str, markup: InlineKeyboardMarkup):
+    # Telegram rate limits / network hiccups => retry
+    for attempt in range(4):
+        try:
+            if g["kind"]=="group":
+                await context.bot.edit_message_text(
                     chat_id=int(g["board_chat_id"]),
+                    message_id=int(g["board_message_id"]),
                     text=text,
                     parse_mode=ParseMode.HTML,
                     reply_markup=markup,
                     disable_web_page_preview=True,
                 )
-                set_game_fields(int(g["id"]), board_message_id=msg.message_id)
-            except Exception:
-                pass
+            else:
+                await context.bot.edit_message_text(
+                    inline_message_id=str(g["board_inline_id"]),
+                    text=text,
+                    parse_mode=ParseMode.HTML,
+                    reply_markup=markup,
+                    disable_web_page_preview=True,
+                )
+            return  # success
+        except RetryAfter as e:
+            wait = float(getattr(e, "retry_after", 1.0))
+            log.warning("RetryAfter %.2fs (attempt %d)", wait, attempt+1)
+            await asyncio.sleep(min(wait, 3.0))
+        except (TimedOut, NetworkError) as e:
+            log.warning("Network/Timeout %s (attempt %d)", e, attempt+1)
+            await asyncio.sleep(0.25 * (attempt+1))
+        except BadRequest as e:
+            msg = str(e).lower()
+            if "message is not modified" in msg:
+                return
+            # inline sometimes: "message can't be edited"
+            log.error("BadRequest edit: %s", e)
+            raise
+    raise RuntimeError("Failed to edit message after retries")
+
+async def edit_board(context: ContextTypes.DEFAULT_TYPE, g: sqlite3.Row, uid_for_kb: int, force_view: Optional[str]=None):
+    gid=int(g["id"])
+    lock = game_lock(context.application, gid)
+
+    async with lock:
+        if force_view:
+            set_game_fields(gid, view=force_view)
+        g = get_game(gid)
+        if not g:
+            return
+
+        text = render_text(g)
+        markup = kb_settings(g) if g["view"]=="settings" else kb_main(g, uid_for_kb)
+
+        try:
+            await _edit_message_safe(context, g, text, markup)
+        except BadRequest:
+            # group fallback: create new board if old isn't editable anymore
+            if g["kind"]=="group":
+                try:
+                    msg = await context.bot.send_message(
+                        chat_id=int(g["board_chat_id"]),
+                        text=text,
+                        parse_mode=ParseMode.HTML,
+                        reply_markup=markup,
+                        disable_web_page_preview=True,
+                    )
+                    set_game_fields(gid, board_message_id=msg.message_id)
+                except Exception as e:
+                    log.error("Group fallback send failed: %s", e)
 
 # =========================
-# TIMEOUT Jobs
+# TIMEOUT Job
 # =========================
 def schedule_timeout(context: ContextTypes.DEFAULT_TYPE, gid: int, actor_id: int):
     key=f"timeout:{gid}"
@@ -610,43 +646,44 @@ async def timeout_job(context: ContextTypes.DEFAULT_TYPE):
     g=get_game(gid)
     if not g or g["status"]!="running":
         return
-    # only if still same actor turn
     cp=current_player(g)
     if not cp or int(cp["user_id"])!=actor:
         return
 
     penalty=random.choice(PENALTIES)
     inc_stat(gid, actor, "penalties", 1)
-
-    # apply penalty: remove reroll if possible
     if rerolls_left(gid, actor)>0 and random.random()<0.5:
         dec_reroll(gid, actor)
 
     create_action(gid, actor, "timeout", "normal", f"TIMEOUT | {penalty}", "timeout")
-
     advance_turn(gid)
     set_game_fields(gid, view="main", phase="choose")
+
     g=get_game(gid)
-    await edit_board(context, g, uid_for_kb=int(cp["user_id"]))
+    if g:
+        new_cp=current_player(g)
+        if new_cp:
+            inc_stat(gid, int(new_cp["user_id"]), "turns", 1)
+            schedule_timeout(context, gid, int(new_cp["user_id"]))
+        await edit_board(context, g, uid_for_kb=actor)
 
 # =========================
-# INLINE: build initial message
+# INLINE: initial message
 # =========================
 def inline_initial_text() -> str:
     return (
         "😈 <b>جرأت/حقیقت Pro</b>\n"
-        "برای شروع بازی دو نفره داخل همین چت:\n"
-        "1) روی «✋ منم میخوام بازی کنم» بزن\n"
-        "2) نفر دوم هم Join کنه\n"
-        "3) سازنده «🎮 شروع بازی» رو بزنه\n\n"
+        "✅ برای اینکه دکمه‌ها تو پی‌وی کار کنه، هر دو نفر یک‌بار /start بات رو بزنن.\n\n"
+        "🎮 شروع بازی دو نفره داخل همین چت:\n"
+        "1) هر دو «✋ منم میخوام بازی کنم»\n"
+        "2) فقط سازنده «🎮 شروع بازی»\n\n"
         "📌 این پیام آپدیت میشه (اسپم صفر)."
     )
 
 def inline_initial_kb() -> InlineKeyboardMarkup:
-    # new:* creates game on first click
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("✋ منم میخوام بازی کنم", callback_data="new:join"),
-         InlineKeyboardButton("⚙️ تنظیمات", callback_data="new:settings")],
+         InlineKeyboardButton("⚙️ تنظیمات", callback_data="new:view:settings")],
         [InlineKeyboardButton("🎮 شروع بازی", callback_data="new:start")],
     ])
 
@@ -660,16 +697,14 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         link=f"https://t.me/{me}?startgroup=true"
         await update.message.reply_text(
             "🎲 جرأت/حقیقت Pro\n\n"
-            "✅ بازی داخل پی‌وی دو نفره:\n"
+            "✅ بازی در پی‌وی دو نفره (داخل همان چت):\n"
             f"داخل چت دونفره بنویس: @{me}\n"
-            "و کارت «شروع بازی» رو انتخاب کن.\n\n"
-            "✅ بازی داخل گروه:\n"
-            "بات رو Add کن و /startgame رو بزن.\n\n"
-            f"📤 لینک اضافه کردن به گروه:\n{link}",
+            "و «شروع بازی» رو انتخاب کن.\n\n"
+            "✅ بازی در گروه:\n"
+            "/startgame\n\n"
+            f"📤 لینک اضافه‌کردن به گروه:\n{link}",
             disable_web_page_preview=True,
         )
-    else:
-        await update.message.reply_text("برای ساخت برد بازی تو گروه: /startgame")
 
 async def cmd_startgame(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat=update.effective_chat
@@ -677,58 +712,42 @@ async def cmd_startgame(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if chat.type not in ("group","supergroup"):
         await update.message.reply_text("این دستور مخصوص گروهه.")
         return
-
-    # create a board message first
     msg = await update.message.reply_text("⏳ در حال ساخت برد بازی…")
     gid = create_group_game(chat.id, user.id, msg.message_id)
-    # auto-join creator
     upsert_player(gid, user.id, user.full_name)
-
     g=get_game(gid)
     await edit_board(context, g, uid_for_kb=user.id)
 
 async def inline_query(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    q = update.inline_query.query or ""
-    # always show "Start Game"
     result = InlineQueryResultArticle(
         id="start_game",
-        title="🎮 شروع بازی جرأت/حقیقت (دو نفره داخل همین چت)",
-        description="یک پیام ثابت میاد و هی آپدیت میشه (مثل BgoGameBot)",
+        title="🎮 شروع بازی جرأت/حقیقت (داخل همین چت)",
+        description="یک پیام ثابت میاد و هی آپدیت میشه (کم‌اسپم)",
         input_message_content=InputTextMessageContent(inline_initial_text(), parse_mode=ParseMode.HTML),
         reply_markup=inline_initial_kb(),
     )
-    await update.inline_query.answer([result], cache_time=1, is_personal=True)
-
-def get_game_from_callback(update: Update) -> Tuple[Optional[sqlite3.Row], Optional[str]]:
-    q = update.callback_query
-    if q is None:
-        return None, None
-    if q.inline_message_id:
-        g = get_game_by_inline_id(q.inline_message_id)
-        return g, "inline"
-    if q.message:
-        chat_id = q.message.chat.id
-        g = get_group_game_by_chat(chat_id)
-        return g, "group"
-    return None, None
+    await update.inline_query.answer([result], cache_time=0, is_personal=True)
 
 async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q=update.callback_query
-    await q.answer()
     user=update.effective_user
-
     data=q.data or ""
+
+    # همیشه سریع جواب بده تا “loading…” نمونه
+    try:
+        await q.answer("✅", show_alert=False)
+    except Exception:
+        pass
+
     # First-time inline: new:*
     if data.startswith("new:"):
-        # must be inline message
         if not q.inline_message_id:
             await q.answer("این بخش فقط برای بازی داخل چت (inline) است.", show_alert=True)
             return
         inline_id=q.inline_message_id
-
-        # create game if not exists
         g=get_game_by_inline_id(inline_id)
         if not g:
+            # Create new inline game
             conn=db(); cur=conn.cursor()
             cur.execute("""
               INSERT INTO games (kind,status,owner_id,board_inline_id,created_at)
@@ -736,15 +755,10 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
             """,(user.id, inline_id, now()))
             gid=int(cur.lastrowid)
             conn.commit(); conn.close()
-            g=get_game(gid)
             upsert_player(gid, user.id, user.full_name)
-
-        # translate new:* to g{gid}:*
+            g=get_game(gid)
         gid=int(g["id"])
-        mapped = data.replace("new:", f"g{gid}:")
-        q.data = mapped
-        data=mapped
-        # continue normal flow
+        data = data.replace("new:", f"g{gid}:")
 
     m=re.match(r"^g(\d+)\:(.+)$", data)
     if not m:
@@ -757,7 +771,7 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await q.answer("این بازی پایان یافته یا وجود ندارد.", show_alert=True)
         return
 
-    # security: ensure callback is from same board
+    # Ensure callback belongs to this board
     if g["kind"]=="inline":
         if not q.inline_message_id or str(q.inline_message_id)!=str(g["board_inline_id"]):
             await q.answer("این پیام مربوط به این بازی نیست.", show_alert=True)
@@ -767,20 +781,19 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await q.answer("این بازی مربوط به این گروه نیست.", show_alert=True)
             return
 
-    # quick view changes
+    # view change
     if action.startswith("view:"):
         view=action.split(":",1)[1]
         if view not in ("main","settings","players","stats"):
             return
         set_game_fields(gid, view=view)
-        g=get_game(gid)
-        await edit_board(context, g, uid_for_kb=user.id)
+        await edit_board(context, get_game(gid), uid_for_kb=user.id)
         return
 
     # settings toggles
     if action.startswith("set:"):
         if user.id!=int(g["owner_id"]) and not is_admin(user.id):
-            await q.answer("فقط سازنده یا ادمین می‌تواند تنظیمات را تغییر دهد.", show_alert=True)
+            await q.answer("فقط سازنده می‌تونه تنظیمات رو عوض کنه.", show_alert=False)
             return
         _, key, val = action.split(":")
         if key=="mid":
@@ -790,41 +803,42 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         elif key=="18":
             set_game_fields(gid, allow_18=int(val))
         set_game_fields(gid, view="settings")
-        g=get_game(gid)
-        await edit_board(context, g, uid_for_kb=user.id)
+        await edit_board(context, get_game(gid), uid_for_kb=user.id)
         return
 
     # join
     if action=="join":
         if g["status"]=="running" and int(g["allow_mid_join"])==0:
-            await q.answer("ورود وسط بازی خاموش است.", show_alert=True)
+            await q.answer("ورود وسط بازی خاموشه.", show_alert=False)
             return
-        upsert_player(gid, user.id, user.full_name)
+        created = upsert_player(gid, user.id, user.full_name)
+        await q.answer("✅ عضو شدی" if created else "✅ قبلاً عضو بودی", show_alert=False)
         await edit_board(context, get_game(gid), uid_for_kb=user.id)
         return
 
-    # start
+    # start (ONLY OWNER)
     if action=="start":
+        if user.id!=int(g["owner_id"]) and not is_admin(user.id):
+            await q.answer("⛔ فقط سازنده می‌تونه شروع کنه.", show_alert=False)
+            return
         players=list_players(gid)
         if len(players)<2:
-            await q.answer("حداقل ۲ نفر باید وارد بازی شوند.", show_alert=True)
+            await q.answer("حداقل ۲ نفر باید Join کنن.", show_alert=False)
             return
-        if user.id!=int(g["owner_id"]) and not is_admin(user.id):
-            await q.answer("فقط سازنده یا ادمین می‌تواند شروع کند.", show_alert=True)
-            return
-        set_game_fields(gid, status="running", locked=1, view="main", phase="choose")
+        set_game_fields(gid, status="running", view="main", phase="choose")
         g=get_game(gid)
         cp=current_player(g)
         if cp:
             inc_stat(gid, int(cp["user_id"]), "turns", 1)
             schedule_timeout(context, gid, int(cp["user_id"]))
+        await q.answer("🔥 بازی شروع شد", show_alert=False)
         await edit_board(context, g, uid_for_kb=user.id)
         return
 
     # end
     if action=="end":
         if user.id!=int(g["owner_id"]) and not is_admin(user.id):
-            await q.answer("فقط سازنده یا ادمین می‌تواند پایان دهد.", show_alert=True)
+            await q.answer("⛔ فقط سازنده می‌تونه پایان بده.", show_alert=False)
             return
         set_game_fields(gid, status="ended", view="main")
         await edit_board(context, get_game(gid), uid_for_kb=user.id)
@@ -832,10 +846,8 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # bump
     if action=="bump":
-        # group: send new board and disable old
         if g["kind"]=="group":
             try:
-                # disable old keyboard quickly
                 try:
                     await context.bot.edit_message_reply_markup(
                         chat_id=int(g["board_chat_id"]),
@@ -844,6 +856,7 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     )
                 except Exception:
                     pass
+                g=get_game(gid)
                 msg=await context.bot.send_message(
                     chat_id=int(g["board_chat_id"]),
                     text=render_text(g),
@@ -852,35 +865,31 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     disable_web_page_preview=True,
                 )
                 set_game_fields(gid, board_message_id=msg.message_id)
-                await q.answer("برد منتقل شد ✅", show_alert=True)
+                await q.answer("✅ منتقل شد", show_alert=False)
             except Exception:
-                await q.answer("نتونستم منتقل کنم.", show_alert=True)
-            return
-        else:
-            await q.answer("✅", show_alert=False)
-            return
+                await q.answer("نتونستم منتقل کنم.", show_alert=False)
+        return
 
-    # prev question
+    # prev question (toast)
     if action=="prev":
         lastq=(g["last_q_text"] or "").strip()
         if not lastq:
-            await q.answer("سوال قبلی نداریم.", show_alert=True)
+            await q.answer("سوال قبلی نداریم.", show_alert=False)
         else:
             show = lastq if len(lastq)<=180 else lastq[:180]+"…"
-            await q.answer(f"سوال قبلی:\n{show}", show_alert=True)
+            await q.answer(show, show_alert=True)
         return
 
     # skip
     if action=="skip":
         if g["status"]!="running":
-            await q.answer("بازی هنوز شروع نشده.", show_alert=True)
+            await q.answer("بازی شروع نشده.", show_alert=False)
             return
         cp=current_player(g)
         if not cp:
             return
-        # اجازه: سازنده/ادمین/بازیکن نوبتی
         if user.id not in (int(g["owner_id"]), int(cp["user_id"])) and not is_admin(user.id):
-            await q.answer("فقط نفر نوبتی یا سازنده/ادمین می‌تواند رد کند.", show_alert=True)
+            await q.answer("⛔ اجازه رد نوبت نداری.", show_alert=False)
             return
         inc_stat(gid, int(cp["user_id"]), "skips_used", 1)
         advance_turn(gid)
@@ -893,19 +902,18 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await edit_board(context, g, uid_for_kb=user.id)
         return
 
-    # reroll
+    # reroll (only current player)
     if action=="reroll":
         if g["status"]!="running":
             return
         cp=current_player(g)
         if not cp or user.id!=int(cp["user_id"]):
-            await q.answer("الان نوبت تو نیست.", show_alert=True)
+            await q.answer("الان نوبت تو نیست.", show_alert=False)
             return
         if rerolls_left(gid, user.id)<=0:
-            await q.answer("تعویضت تموم شده.", show_alert=True)
+            await q.answer("تعویضت تموم شده.", show_alert=False)
             return
         dec_reroll(gid, user.id)
-        # stays in choose
         schedule_timeout(context, gid, user.id)
         await edit_board(context, get_game(gid), uid_for_kb=user.id)
         return
@@ -916,7 +924,7 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         cp=current_player(g)
         if not cp or user.id!=int(cp["user_id"]):
-            await q.answer("الان نوبت تو نیست.", show_alert=True)
+            await q.answer("الان نوبت تو نیست.", show_alert=False)
             return
 
         _, qtype, level = action.split(":")
@@ -924,13 +932,13 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
             qtype=random.choice(["truth","dare"])
             level=random.choice(["normal","18"])
         if level=="18" and int(g["allow_18"])==0:
-            await q.answer("سوالات +18 خاموش است.", show_alert=True)
+            await q.answer("+18 خاموشه.", show_alert=False)
             return
 
         forced = pop_forced(gid, user.id, qtype, level)
         text = forced or pick_random_question(qtype, level)
         if not text:
-            await q.answer("سوال پیدا نشد. ادمین باید سوال اضافه کند.", show_alert=True)
+            await q.answer("سوال نداریم. با Bulk اضافه کن.", show_alert=True)
             return
 
         set_game_fields(
@@ -947,21 +955,20 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await edit_board(context, get_game(gid), uid_for_kb=user.id)
         return
 
-    # done/refuse/confirm
+    # refuse
     if action=="refuse":
         if g["status"]!="running":
             return
         cp=current_player(g)
         if not cp or user.id!=int(cp["user_id"]):
-            await q.answer("الان نوبت تو نیست.", show_alert=True)
+            await q.answer("الان نوبت تو نیست.", show_alert=False)
             return
         penalty=random.choice(PENALTIES)
         inc_stat(gid, user.id, "penalties", 1)
-        # maybe remove reroll
         if rerolls_left(gid, user.id)>0 and random.random()<0.7:
             dec_reroll(gid, user.id)
-
         create_action(gid, user.id, "refuse", "normal", penalty, "refused")
+
         advance_turn(gid)
         set_game_fields(gid, phase="choose", view="main")
         g=get_game(gid)
@@ -972,16 +979,17 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await edit_board(context, g, uid_for_kb=user.id)
         return
 
+    # done
     if action=="done":
         if g["status"]!="running":
             return
         cp=current_player(g)
         if not cp or user.id!=int(cp["user_id"]):
-            await q.answer("الان نوبت تو نیست.", show_alert=True)
+            await q.answer("الان نوبت تو نیست.", show_alert=False)
             return
 
         players=list_players(gid)
-        # inline: require counterpart confirm if exactly 2 players
+        # inline 2-player: need confirm
         if g["kind"]=="inline" and len(players)==2:
             set_game_fields(gid, phase="wait_confirm", view="main")
             la=last_action(gid)
@@ -989,11 +997,11 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 conn=db(); cur=conn.cursor()
                 cur.execute("UPDATE actions SET status='done_wait' WHERE id=?;",(int(la["id"]),))
                 conn.commit(); conn.close()
-            schedule_timeout(context, gid, user.id)  # still timer
+            schedule_timeout(context, gid, user.id)
             await edit_board(context, get_game(gid), uid_for_kb=user.id)
             return
 
-        # group or inline with >2: accept self-report
+        # others: self report
         la=last_action(gid)
         if la:
             conn=db(); cur=conn.cursor()
@@ -1010,20 +1018,19 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await edit_board(context, g, uid_for_kb=user.id)
         return
 
+    # confirm (2-player)
     if action.startswith("confirm:"):
         if g["status"]!="running":
             return
         players=list_players(gid)
         if len(players)!=2:
-            await q.answer("این تایید فقط برای بازی دو نفره است.", show_alert=True)
+            await q.answer("این تایید فقط برای دو نفره‌ست.", show_alert=False)
             return
         cp=current_player(g)
-        if not cp:
-            return
         actor=int(cp["user_id"])
         counterpart = [p for p in players if int(p["user_id"])!=actor][0]
         if user.id != int(counterpart["user_id"]):
-            await q.answer("فقط طرف مقابل می‌تواند تایید کند.", show_alert=True)
+            await q.answer("فقط طرف مقابل می‌تونه تایید کنه.", show_alert=False)
             return
 
         decision = action.split(":")[1]
@@ -1039,6 +1046,9 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if rerolls_left(gid, actor)>0 and random.random()<0.7:
                 dec_reroll(gid, actor)
             create_action(gid, actor, "reject", "normal", penalty, "rejected")
+            await q.answer("👎 رد شد + مجازات", show_alert=False)
+        else:
+            await q.answer("👍 تایید شد", show_alert=False)
 
         advance_turn(gid)
         set_game_fields(gid, phase="choose", view="main")
@@ -1051,7 +1061,7 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
 # =========================
-# Admin flows (Bulk add / approve suggestions / force question)
+# Admin / Suggestions (همون قبلی، فقط نگه داشتیم)
 # =========================
 def flow_set(context: ContextTypes.DEFAULT_TYPE, name: Optional[str], data: Optional[dict]=None):
     if not name:
@@ -1071,7 +1081,6 @@ async def cmd_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/bulk_truth  یا /bulk_dare  یا /bulk_truth18  یا /bulk_dare18\n"
         "/pending  (پیشنهادها)\n"
         "/force  (سؤال مخفی برای بازیکن)\n"
-        "/qsearch <کلمه>\n"
     )
 
 async def cmd_bulk(update: Update, context: ContextTypes.DEFAULT_TYPE, qtype: str, level: str):
@@ -1109,36 +1118,16 @@ async def cmd_pending(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def cmd_force(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update.effective_user.id):
         return
-    # list last running games
     conn=db(); cur=conn.cursor()
-    cur.execute("SELECT id,kind,status,board_chat_id FROM games WHERE status='running' ORDER BY id DESC LIMIT 10;")
+    cur.execute("SELECT id,kind,status FROM games WHERE status='running' ORDER BY id DESC LIMIT 10;")
     rows=cur.fetchall(); conn.close()
     if not rows:
         await update.message.reply_text("هیچ بازی running نیست.")
         return
     kb=[]
     for r in rows:
-        label=f"#{r['id']} ({r['kind']})"
-        kb.append([InlineKeyboardButton(label, callback_data=f"adm:fg:{r['id']}")])
+        kb.append([InlineKeyboardButton(f"#{r['id']} ({r['kind']})", callback_data=f"adm:fg:{r['id']}")])
     await update.message.reply_text("یک بازی رو انتخاب کن:", reply_markup=InlineKeyboardMarkup(kb))
-
-async def cmd_qsearch(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update.effective_user.id):
-        return
-    kw=" ".join(context.args).strip()
-    if not kw:
-        await update.message.reply_text("مثال: /qsearch حسادت")
-        return
-    conn=db(); cur=conn.cursor()
-    cur.execute("SELECT id,qtype,level,text FROM questions WHERE enabled=1 AND text LIKE ? ORDER BY id DESC LIMIT 10;",(f"%{kw}%",))
-    rows=cur.fetchall(); conn.close()
-    if not rows:
-        await update.message.reply_text("چیزی پیدا نشد.")
-        return
-    out=["🔎 نتایج:"]
-    for r in rows:
-        out.append(f"#{r['id']} | {r['qtype']}/{r['level']} | {r['text']}")
-    await update.message.reply_text("\n".join(out))
 
 async def admin_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q=update.callback_query
@@ -1147,7 +1136,6 @@ async def admin_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await q.answer("⛔️", show_alert=True)
         return
     data=q.data or ""
-    # approve/reject suggestion
     m=re.match(r"^adm\:(ap|rj)\:(\d+)$", data)
     if m:
         act=m.group(1); sid=int(m.group(2))
@@ -1166,16 +1154,15 @@ async def admin_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await q.message.reply_text("✅ انجام شد.")
         return
 
-    # force pick game -> player -> text
     m=re.match(r"^adm\:fg\:(\d+)$", data)
     if m:
         gid=int(m.group(1))
-        players=list_players(gid)
-        if not players:
+        ps=list_players(gid)
+        if not ps:
             await q.message.reply_text("بازیکنی ندارد.")
             return
         kb=[]
-        for p in players:
+        for p in ps:
             kb.append([InlineKeyboardButton(p["name"], callback_data=f"adm:fp:{gid}:{p['user_id']}")])
         await q.message.reply_text("بازیکن رو انتخاب کن:", reply_markup=InlineKeyboardMarkup(kb))
         return
@@ -1192,7 +1179,6 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not flow:
         return
 
-    # bulk add
     if flow["name"]=="bulk":
         if not is_admin(update.effective_user.id):
             flow_set(context,None); return
@@ -1211,7 +1197,6 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"✅ {len(items)} سؤال اضافه شد.")
         return
 
-    # forced question
     if flow["name"]=="force_text":
         if not is_admin(update.effective_user.id):
             flow_set(context,None); return
@@ -1225,49 +1210,6 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("✅ سؤال مخفی صف شد (لو نمی‌رود).")
         return
 
-async def cmd_suggest(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # user suggestion in private
-    chat=update.effective_chat
-    if chat.type!="private":
-        await update.message.reply_text("این دستور رو تو پی‌وی بات بزن.")
-        return
-    flow_set(context,"suggest_type",{})
-    kb=InlineKeyboardMarkup([
-        [InlineKeyboardButton("👀 حقیقت", callback_data="sg:truth:normal"),
-         InlineKeyboardButton("😅 جرأت", callback_data="sg:dare:normal")],
-        [InlineKeyboardButton("🔥 حقیقت +18", callback_data="sg:truth:18"),
-         InlineKeyboardButton("💦 جرأت +18", callback_data="sg:dare:18")],
-    ])
-    await update.message.reply_text("نوع سوال پیشنهادی رو انتخاب کن:", reply_markup=kb)
-
-async def suggest_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    q=update.callback_query
-    await q.answer()
-    m=re.match(r"^sg\:(truth|dare)\:(normal|18)$", q.data or "")
-    if not m:
-        return
-    flow_set(context,"suggest_text",{"qtype":m.group(1),"level":m.group(2)})
-    await q.message.reply_text("متن سوال(ها) رو بفرست. چندتا هم می‌تونی با 1= 2= ...")
-
-async def on_text_suggest(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    flow=flow_get(context)
-    if not flow or flow["name"]!="suggest_text":
-        return False
-    qtype=flow["data"]["qtype"]; level=flow["data"]["level"]
-    items=parse_bulk(update.message.text or "")
-    if not items:
-        await update.message.reply_text("چیزی دریافت نشد.")
-        return True
-    conn=db(); cur=conn.cursor()
-    cur.executemany(
-        "INSERT INTO suggestions (user_id,chat_id,qtype,level,text,status,created_at) VALUES (?,?,?,?,?,'pending',?);",
-        [(update.effective_user.id, update.effective_chat.id, qtype, level, t, now()) for t in items]
-    )
-    conn.commit(); conn.close()
-    flow_set(context,None)
-    await update.message.reply_text(f"✅ {len(items)} پیشنهاد ثبت شد و منتظر تایید ادمین است.")
-    return True
-
 # =========================
 # App
 # =========================
@@ -1277,41 +1219,28 @@ def build_app() -> Application:
 
     app = Application.builder().token(BOT_TOKEN).build()
 
-    # commands
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("startgame", cmd_startgame))
 
     app.add_handler(CommandHandler("admin", cmd_admin))
     app.add_handler(CommandHandler("pending", cmd_pending))
     app.add_handler(CommandHandler("force", cmd_force))
-    app.add_handler(CommandHandler("qsearch", cmd_qsearch))
 
     app.add_handler(CommandHandler("bulk_truth", lambda u,c: cmd_bulk(u,c,"truth","normal")))
     app.add_handler(CommandHandler("bulk_dare", lambda u,c: cmd_bulk(u,c,"dare","normal")))
     app.add_handler(CommandHandler("bulk_truth18", lambda u,c: cmd_bulk(u,c,"truth","18")))
     app.add_handler(CommandHandler("bulk_dare18", lambda u,c: cmd_bulk(u,c,"dare","18")))
 
-    app.add_handler(CommandHandler("suggest", cmd_suggest))
-
-    # inline
     app.add_handler(InlineQueryHandler(inline_query))
 
-    # callbacks (order matters)
     app.add_handler(CallbackQueryHandler(admin_cb, pattern=r"^adm:"))
-    app.add_handler(CallbackQueryHandler(suggest_cb, pattern=r"^sg:"))
     app.add_handler(CallbackQueryHandler(callback_router))
 
-    # texts (bulk / force / suggest)
-    async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-        if await on_text_suggest(update, context):
-            return
-        await on_text(update, context)
-
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_handler))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
 
     return app
 
 if __name__ == "__main__":
     application = build_app()
-    print("Bot is running (polling)...")
+    log.info("Bot is running (polling)...")
     application.run_polling(allowed_updates=Update.ALL_TYPES)
